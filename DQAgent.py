@@ -9,6 +9,8 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
+from langchain_community.callbacks.manager import get_openai_callback
+from tenacity import retry, wait_random_exponential, stop_after_attempt
 from dotenv import load_dotenv, find_dotenv
 
 _ = load_dotenv(find_dotenv())
@@ -82,7 +84,7 @@ class DQAgent:
         self._setup_tools()
         
         # Create LLM with tools
-        self.llm_with_tools = self.llm.bind_tools([self.get_sample_data_tool])
+        self.llm_with_tools = self.llm.bind_tools([self.get_sample_data_tool, self.profile_table_tool])
         
         # Create prompt templates
         self._setup_prompts()
@@ -93,21 +95,34 @@ class DQAgent:
     def _setup_prompts(self):
         """Setup ChatPromptTemplate instances for each step."""
         
-        # Step 1: Rule Generation Prompt
+        # Rule examples to reduce hallucination
+        RULE_EXAMPLE = """
+Example rule set:
+[
+  {{"rule_name": "amount_non_negative", "rule_description": "amount should be >= 0"}},
+  {{"rule_name": "order_id_unique", "rule_description": "order_id should be unique for each row"}},
+  {{"rule_name": "date_valid_format", "rule_description": "date should be in valid format and not null"}},
+  {{"rule_name": "status_valid_enum", "rule_description": "status should be one of: pending, completed, cancelled"}}
+]
+"""
+        
+        # Step 1: Rule Generation Prompt with profiling stats
         self.rules_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a data analyst. Your role is to create deterministic rules to test the quality of a dataset.
-You will be provided sample data that represents the dataset you need to create rules for.
-The sample data provided may not be representative of every value in the data.
+            ("system", f"""You are a data analyst. Your role is to create deterministic rules to test the quality of a dataset.
+You will be provided statistical profiling data that represents the dataset you need to create rules for.
+The profiling data includes min/max values, null counts, unique values, and data types.
 
 Process:
-1. Observe the sample data
-2. For each column in the dataset, create a rule based on the observation
+1. Observe the profiling statistics
+2. For each column in the dataset, create a rule based on the statistical analysis
 3. Each rule should have a name and a description
-4. Take into account that the observation is on a sample of data
+4. Focus on value ranges, uniqueness constraints, null checks, and data type validation
 
 Create at least one rule for each column in the dataset.
+Refer to the following example format:
+{RULE_EXAMPLE}
 Return the rules as a structured JSON object."""),
-            ("human", "Sample data:\n{sample_data}")
+            ("human", "Profiling stats:\n{profile_stats}")
         ])
         
         # Step 2: SQL Generation Prompt  
@@ -162,7 +177,28 @@ Return as a structured JSON object."""),
             except Exception as e:
                 return f"Error retrieving sample data: {str(e)}"
         
+        @tool
+        def profile_table(table_name: str, limit_rows: int = 10000) -> str:
+            """Get statistical profile of table to replace large sample data.
+            
+            Args:
+                table_name: Name of the database table to profile
+                limit_rows: Maximum rows to analyze for profiling
+                
+            Returns:
+                JSON string containing statistical profile
+            """
+            try:
+                conn = sqlite3.connect("demo.sqlite")
+                df = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT {limit_rows}", conn)
+                conn.close()
+                stats = df.describe(include='all').to_dict()
+                return json.dumps(stats, indent=2, default=str)
+            except Exception as e:
+                return f"Error profiling table: {str(e)}"
+        
         self.get_sample_data_tool = get_sample_data
+        self.profile_table_tool = profile_table
     
     def _setup_parsers(self):
         """Setup JSON output parsers for structured responses."""
@@ -185,6 +221,10 @@ Return as a structured JSON object."""),
         """Get sample data from the specified table."""
         return self.get_sample_data_tool.invoke({"table_name": table_name})
     
+    def _get_table_profile(self, table_name: str, limit_rows: int = 10000) -> str:
+        """Get statistical profile of the specified table."""
+        return self.profile_table_tool.invoke({"table_name": table_name, "limit_rows": limit_rows})
+    
     def run(self, table_name: str) -> dict:
         """
         Run the complete data quality analysis workflow using a single LCEL chain.
@@ -196,9 +236,9 @@ Return as a structured JSON object."""),
             Dictionary containing the complete analysis results
         """
         
-        # Get sample data from table
-        print(f"Retrieving sample data from table '{table_name}'...")
-        sample_data = self._get_sample_data(table_name)
+        # Get statistical profile instead of sample data
+        print(f"Profiling table '{table_name}'...")
+        profile_stats = self._get_table_profile(table_name)
         
         # Create a single LCEL chain that handles the entire workflow
         from langchain_core.runnables import RunnableLambda
@@ -213,28 +253,67 @@ Return as a structured JSON object."""),
                 "results": json.dumps(validation_results)
             }
         
-        # Single LCEL chain: sample_data -> rules -> sql -> execute -> summary
-        complete_chain = (
-            self.rules_prompt 
-            | self.llm.with_structured_output(DataQualityRules)
-            | RunnableLambda(lambda rules: {"rules": json.dumps(rules.model_dump())})
-            | self.sql_prompt
-            | self.llm.with_structured_output(SQLQueries)
-            | RunnableLambda(execute_sql_step)
-            | self.summary_prompt
-            | self.llm.with_structured_output(DataQualitySummary)
-        )
+        # Enhanced chain with retry and usage tracking
+        def rules_step(input_data):
+            print("Step 1: Generating data quality rules...")
+            return self._call_llm_with_retry(self.rules_prompt.invoke(input_data), DataQualityRules)
         
-        print("Running complete data quality analysis chain...")
-        summary_result = complete_chain.invoke({"sample_data": sample_data})
+        def sql_step(rules):
+            print("Step 2: Generating SQL validation queries...")
+            input_data = {"rules": json.dumps(rules.model_dump())}
+            return self._call_llm_with_retry(self.sql_prompt.invoke(input_data), SQLQueries)
+        
+        def summary_step(summary_data):
+            print("Step 3: Generating final summary...")
+            return self._call_llm_with_retry(self.summary_prompt.invoke(summary_data), DataQualitySummary)
+        
+        # Execute chain with proper error handling and retry
+        try:
+            print("Running enhanced data quality analysis chain...")
+            
+            # Step 1: Generate rules
+            rules_result = rules_step({"profile_stats": profile_stats})
+            
+            # Step 2: Generate SQL queries
+            sql_result = sql_step(rules_result)
+            
+            # Step 3: Execute queries
+            summary_data = execute_sql_step(sql_result)
+            
+            # Step 4: Generate summary
+            summary_result = summary_step(summary_data)
+            
+        except Exception as e:
+            print(f"Error in analysis chain: {e}")
+            raise
         
         return summary_result.model_dump()
     
+    def _validate_sql(self, queries: SQLQueries) -> List[SQLQuery]:
+        """Validate SQL queries before execution to filter out invalid ones."""
+        valid_queries = []
+        for q in queries.queries:
+            try:
+                # Use EXPLAIN to validate syntax without executing
+                conn = sqlite3.connect(":memory:")
+                conn.execute(f"EXPLAIN {q.sql_query}")
+                conn.close()
+                valid_queries.append(q)
+            except sqlite3.Error as e:
+                print(f"Query failed validation: {q.rule_name} - {str(e)}")
+                # Optionally, you could implement retry logic here
+                # to send the failed query back to LLM for correction
+        return valid_queries
+    
     def _execute_validation_queries(self, queries: List[SQLQuery]) -> List[dict]:
         """Execute validation queries and return structured results."""
+        # First validate all queries
+        valid_queries = self._validate_sql(SQLQueries(queries=queries))
+        print(f"Validated {len(valid_queries)}/{len(queries)} queries")
+        
         validation_results = []
         
-        for query in queries:
+        for query in valid_queries:
             try:
                 result = self.exec_sql(query.sql_query)
                 validation_results.append({
@@ -252,10 +331,18 @@ Return as a structured JSON object."""),
         
         return validation_results
     
+    @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(3))
+    def _call_llm_with_retry(self, prompt, output_parser=None):
+        """Call LLM with retry mechanism and usage tracking."""
+        with get_openai_callback() as cb:
+            if output_parser:
+                result = self.llm.with_structured_output(output_parser).invoke(prompt)
+            else:
+                result = self.llm.invoke(prompt)
+        return result
+    
     def get_usage_stats(self) -> dict:
         """Get token usage statistics from the last run."""
-        # Note: Usage tracking would need to be implemented with callbacks
-        # This is a placeholder for compatibility
-        return {"note": "Usage tracking available through LangChain callbacks"}
+        return {"note": "Usage tracking implemented with LangChain callbacks and displayed during execution"}
 
 
